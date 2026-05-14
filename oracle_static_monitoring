@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""
+Oracle Static Log Collection Monitoring Script
+-----------------------------------------------
+Checks which Oracle DB hosts are sending logs to Splunk (via Elasticsearch),
+compares against an internal referential, and generates a CSV/Excel report
+sent by email and stored in PostgreSQL.
+
+HOW TO ADD A NEW REGION:
+    1. Add the region key to list_oracle_static in lst_static.py
+    2. That's it — no changes needed in this script.
+"""
+
+import os
+import sys
+import csv
+import logging
+import time
+from datetime import datetime, timedelta
+
+import pandas as pd
+import urllib3
+from elasticsearch import Elasticsearch
+from elasticsearch.helpers import scan
+
+# ---------------------------------------------------------------------------
+# Add parent directory to path for local libs
+# ---------------------------------------------------------------------------
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from libs.splunk_helper import *
+from libs.local_settings import *
+from libs.db_helpers import create_table, db_conn
+from lst_static import list_oracle_static
+from mail.send_mail import sendmail
+
+# ---------------------------------------------------------------------------
+# Logging configuration
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+SPLUNK_EARLIEST = "-1d@d"
+SPLUNK_LATEST = "@d"
+
+ES_INDEX_COLLECT = "collect_splunk_ip"
+ES_INDEX_DALI = "dali_servers"
+
+OUTPUT_CSV = "oracle_static_collection_status.csv"
+OUTPUT_XLSX = OUTPUT_CSV.replace(".csv", ".xlsx")
+
+DB_TABLE = "mon_oracle_static_daily"
+TABLE_SCHEMA = f"""
+    CREATE TABLE IF NOT EXISTS {DB_TABLE} (
+        id SERIAL PRIMARY KEY,
+        date TIMESTAMP,
+        domain VARCHAR NOT NULL,
+        device VARCHAR NOT NULL,
+        collected BOOLEAN NOT NULL
+    );
+"""
+
+MAIL_FROM = 'watchsoc@socgen.com'
+MAIL_TO = ['WORLD-LGC-DB-ORACLE@socgen.com']
+MAIL_SUBJECT = "Automatic reports - [MALDIVES] Oracle static"
+MAIL_BODY = "CSV report in attachment<br><br>"
+
+# Exclusion list — devices in blackout/backup/dataguard down are excluded
+EXCLUSION_KEY = "dataguard_down_blackout_backup"
+
+# ---------------------------------------------------------------------------
+# Disable SSL warnings
+# ---------------------------------------------------------------------------
+urllib3.disable_warnings(category=urllib3.exceptions.InsecureRequestWarning)
+
+# ---------------------------------------------------------------------------
+# Database cursor
+# ---------------------------------------------------------------------------
+db_cursor = db_conn.cursor()
+
+
+# ---------------------------------------------------------------------------
+# Functions
+# ---------------------------------------------------------------------------
+
+def get_collected_hosts(value_day: int) -> list:
+    """
+    Query Elasticsearch to get the list of hosts that sent Oracle logs
+    in the last `value_day` days.
+    Retries recursively up to value_day+7 days back if no results found.
+    """
+    logger.info(f"Querying Elasticsearch for collected hosts (last {value_day} day(s))...")
+
+    query = {
+        "query": {
+            "bool": {
+                "minimum_should_match": 1,
+                "must": [
+                    {
+                        "range": {
+                            "date": {
+                                "gte": f"now-{value_day}d",
+                                "lte": "now"
+                            }
+                        }
+                    }
+                ],
+                "should": [
+                    {"match_phrase": {"index.keyword": "oracledb"}},
+                    {"match_phrase": {"index.keyword": "oracledb_all_nydfs"}}
+                ]
+            }
+        }
+    }
+
+    collected_hosts = []
+    found = False
+
+    results = scan(elastic, index=ES_INDEX_COLLECT, query=query, request_timeout=300)
+    for hit in results:
+        found = True
+        host = hit['_source']['host'].upper()
+        if host not in collected_hosts:
+            collected_hosts.append(host)
+
+    if found:
+        logger.info(f"Found {len(collected_hosts)} collected hosts.")
+        return collected_hosts
+    else:
+        logger.warning(f"No results for day={value_day}, retrying with day={value_day + 1}...")
+        return get_collected_hosts(value_day + 1)
+
+
+def get_dali_hosts_for_region(region: str, host_list: list) -> list:
+    """
+    Query Elasticsearch DALI index to get the actual server hostnames
+    for a given region and list of expected hosts.
+    Returns the list of hosts found in DALI.
+    """
+    host_upper = [h.upper() for h in host_list]
+
+    query = {
+        "_source": ["server_hostname"],
+        "query": {
+            "bool": {
+                "must": [
+                    {"terms": {"server_hostname.keyword": host_upper}}
+                ]
+            }
+        }
+    }
+
+    dali_hosts = []
+    results = scan(elastic, index=ES_INDEX_DALI, query=query, request_timeout=300)
+    for hit in results:
+        hostname = hit['_source']['server_hostname'].upper()
+        dali_hosts.append(hostname)
+
+    # Log hosts present in referential but missing from DALI
+    missing = set(host_upper) - set(dali_hosts)
+    if missing:
+        logger.warning(f"[{region}] Hosts NOT present in DALI: {missing}")
+
+    return dali_hosts
+
+
+def compare(ref_hosts: list, collected_hosts: list) -> list:
+    """
+    Returns the list of ref_hosts that are NOT in any of the collected host strings.
+    A host is considered collected if its name appears (case-insensitive) in
+    any element of the collected list.
+    """
+    not_collected = []
+    for ref_host in ref_hosts:
+        found = any(ref_host.upper() in c for c in collected_hosts)
+        if not found:
+            not_collected.append(ref_host)
+    return not_collected
+
+
+def write_csv(ref: dict, collected: list, today: datetime, exclusions: list) -> str:
+    """
+    Generate the CSV report for all regions.
+    Devices in the exclusion list are written separately under DATAGUARD_DOWN_BLACKOUT_BACKUP domain.
+    Returns the filename.
+    """
+    logger.info(f"Writing CSV report to {OUTPUT_CSV}...")
+
+    with open(OUTPUT_CSV, mode="w", newline="") as file:
+        writer = csv.writer(file, delimiter=";")
+        writer.writerow(["date", "domain", "device", "collected"])
+
+        for region, host_list in ref.items():
+            if region == EXCLUSION_KEY:
+                continue  # handled separately
+
+            not_collected = compare(host_list, collected)
+            collected_in_region = [h for h in host_list if h not in not_collected]
+
+            for device in not_collected:
+                if device in exclusions:
+                    continue
+                writer.writerow([today, region.upper(), device, False])
+
+            for device in collected_in_region:
+                if device in exclusions:
+                    continue
+                writer.writerow([today, region.upper(), device, True])
+
+        # Write exclusion/blackout devices separately
+        for device in exclusions:
+            in_collected = any(device.upper() in c for c in collected)
+            writer.writerow([today, "DATAGUARD_DOWN_BLACKOUT_BACKUP", device, in_collected])
+
+    logger.info("CSV written successfully.")
+    return OUTPUT_CSV
+
+
+def save_to_database(filename: str):
+    """
+    Load the CSV into the PostgreSQL table using COPY.
+    """
+    logger.info(f"Saving data to database table {DB_TABLE}...")
+    with open(filename, 'r') as file:
+        next(file)  # skip header
+        db_cursor.copy_from(
+            file,
+            DB_TABLE,
+            sep=';',
+            columns=("date", "domain", "device", "collected")
+        )
+    db_cursor.close()
+    logger.info("Data saved to database.")
+
+
+def send_email_report(csv_file: str):
+    """
+    Convert CSV to Excel and send by email, then clean up temp files.
+    """
+    logger.info("Sending email report...")
+    xlsx_file = csv_file.replace(".csv", ".xlsx")
+    pd.read_csv(csv_file, sep=";").to_excel(xlsx_file, index=False)
+
+    sendmail(
+        MAIL_FROM,
+        MAIL_TO,
+        MAIL_SUBJECT,
+        MAIL_BODY,
+        attachments=xlsx_file
+    )
+    logger.info("Email sent.")
+
+    # Cleanup
+    os.remove(csv_file)
+    os.remove(xlsx_file)
+    logger.info("Temporary files deleted.")
+
+
+def clear_today_data(date: datetime):
+    """
+    Delete today's data from the DB before reinserting (idempotent run).
+    """
+    logger.info(f"Clearing today's data for date={date}...")
+    db_cursor.execute(f"DELETE FROM {DB_TABLE} WHERE date = '{date}'")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    today_full = datetime.today()
+    today = datetime(today_full.year, today_full.month, today_full.day, 0, 0, 0, 0)
+
+    try:
+        # 1. Ensure DB table exists
+        create_table(TABLE_SCHEMA)
+
+        # 2. Clear today's existing data (idempotent)
+        clear_today_data(today)
+
+        # 3. Get collected hosts from Elasticsearch
+        collected = get_collected_hosts(1)
+
+        # 4. Get exclusion list
+        exclusions = [h.upper() for h in list_oracle_static.get(EXCLUSION_KEY, [])]
+
+        # 5. Write CSV report
+        csv_file = write_csv(list_oracle_static, collected, today, exclusions)
+
+        # 6. Save to database
+        save_to_database(csv_file)
+
+        # 7. Send email report
+        send_email_report(csv_file)
+
+        logger.info("Script completed successfully.")
+
+    except Exception as err:
+        logger.error(f"Main failed! Error: {err}", exc_info=True)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
